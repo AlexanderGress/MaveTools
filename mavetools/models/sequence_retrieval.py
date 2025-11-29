@@ -1,8 +1,12 @@
 import socket
 import time
+import sys
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import requests
+import json
 from Bio import Entrez
 
 from mavetools.models.utils import parseFasta
@@ -33,6 +37,63 @@ def connection_sleep_cycle():
         print('No connection, sleeping a bit and then try again')
         time.sleep(30)
 
+
+def retrieve_transcript_sequences(transcript_ids, recursed = False):
+    rest_url = 'https://rest.ensembl.org/sequence/id'
+
+    headers = { "Content-Type" : "application/json", "Accept" : "application/json"}
+    transcript_seq_dict = {}
+    chunksize = 45
+    transcript_ids = list(transcript_ids)
+    chunk = transcript_ids[:chunksize]
+    i = 0
+    try_number = 0
+    empty_seqs = {}
+    while len(chunk) > 0:
+
+        data = json.dumps({'ids':chunk})
+
+        try:
+            r = requests.post(rest_url, headers = headers, data = data, params = {'type' : 'protein'})
+        except:
+            try_number += 1
+            if try_number == 4:
+                [e, f, g] = sys.exc_info()
+                g = traceback.format_exc()
+                print(f'POST request failed: {e}\n{f}\n{g}')
+                break
+            time.sleep(try_number*2)
+            continue
+
+        if not r.ok:
+            try:
+                r.raise_for_status()
+            except requests.exceptions.HTTPError as errh:
+                print(f'Transcript Sequence Retrieval failed: {data}\nError: {errh.response.status_code}\n{errh.response.text}')
+            if recursed:
+                return {}, {transcript_ids[0]:None}
+            for transcript_id in chunk:
+                seq_sub_dict, sub_empty_seqs = retrieve_transcript_sequences([transcript_id], recursed=True)
+                transcript_seq_dict.update(seq_sub_dict)
+                empty_seqs.update(sub_empty_seqs)
+            i += 1
+            chunk = transcript_ids[(chunksize*i):(chunksize*(i+1))]
+            continue
+            #r.raise_for_status()
+            #return None
+
+        decoded = r.json()
+        try_number = 0
+
+        for entry in decoded:
+            transcript_id = entry['query']
+            nt_seq = entry['seq']
+            transcript_seq_dict[transcript_id] = nt_seq
+
+        i += 1
+        chunk = transcript_ids[(chunksize*i):(chunksize*(i+1))]
+
+    return transcript_seq_dict, empty_seqs
 
 def getUniprotSequence(uniprot_ac, tries=0):
 
@@ -117,19 +178,29 @@ def get_refseq_sequences(refseqs, seq_type='protein'):
     Entrez.email = ''
 
     ret_type = 'fasta_cds_aa'
-    if seq_type == 'protein':
+    if seq_type == 'protein' or seq_type == 'nucleotide':
         ret_type = 'fasta'
 
-    net_handle = Entrez.efetch(
+    try:
+        net_handle = Entrez.efetch(
         db=seq_type, id=refseqs, rettype=ret_type, retmode="text"
-    )
+        )
+    except:
+        [e, f, g] = sys.exc_info()
+        g = traceback.format_exc()
+        print(f'Sequence retrieval failed for {refseqs=}\n{e}\n{f}\n{g}')
+        return {}
     page = net_handle.read()
     net_handle.close()
     right_split = '_prot'
     left_split = '|'
     if seq_type == 'protein':
         right_split = ' '
+        left_split = None    
+    elif seq_type == 'nucleotide':
         left_split = None
+        right_split = '.'
+
     seq_map = parseFasta(page=page, left_split=left_split, right_split=right_split)
 
     return seq_map

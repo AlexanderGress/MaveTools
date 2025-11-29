@@ -1,11 +1,14 @@
 import attr
 import json
 import os
+import sys
+import traceback
 from typing import Any, BinaryIO, Dict, List, Optional, Union
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
+
 from scipy import stats
 
 from .base import APIObject
@@ -15,7 +18,7 @@ from .target import Target
 from .utils import attrs_filter, attrs_serializer, prepare_for_encoding, get_variant_type, median, score_scale_function, second_scale, disect_hgvs_single_pos
 from fqfa.util.translate import translate_dna
 
-from mavetools.models.sequence_retrieval import getUniprotSequence, get_refseq_sequences
+from mavetools.models.sequence_retrieval import getUniprotSequence, get_refseq_sequences, retrieve_transcript_sequences
 from mavetools.models.utils import aac_to_hgvs_pro
 
 @attr.s
@@ -47,11 +50,19 @@ class ScoreSet(APIObject, Dataset):
     is_meta_analysis: Optional[bool] = attr.ib(kw_only=True, default=None)
     
     dataUsagePolicy: Optional[str] = attr.ib(kw_only=True, default=None)
-    supersededScoreSetUrn: Optional[str] = attr.ib(kw_only=True, default=None)
-    supersedingScoreSetUrn: Optional[str] = attr.ib(kw_only=True, default=None)
+    supersededScoreSet: Optional[str] = attr.ib(kw_only=True, default=None)
+    supersedingScoreSet: Optional[str] = attr.ib(kw_only=True, default=None)
     metaAnalyzesScoreSetUrns: Optional[List[str]] = attr.ib(kw_only=True, default=None)
     metaAnalyzedByScoreSetUrns: Optional[List[str]] = attr.ib(kw_only=True, default=None)
-    
+
+    externalLinks = attr.ib(kw_only=True, default=None)
+    scoreRanges = attr.ib(kw_only=True, default=None)
+    mappingState = attr.ib(kw_only=True, default=None)
+    mappingErrors = attr.ib(kw_only=True, default=None)
+    keywords = attr.ib(kw_only=True, default=None)
+    recordType = attr.ib(kw_only=True, default=None)
+    scoreCalibrations = attr.ib(kw_only=True, default=None)
+    corrected_seq = None
 
     def api_url() -> str:
         """
@@ -72,42 +83,97 @@ class ScoreSet(APIObject, Dataset):
         return ScoreSet(**json_dict)
 
     def get_protein_sequence(self):
-        raw_seq = self.targetGenes[0]['targetSequence']['sequence']
+        if self.current_version == 'ProteinGym' or self.current_version == 'Domainome':
+            return self.target['reference_sequence']['sequence']
+        try:
+            raw_seq = self.targetGenes[0]['targetSequence']['sequence']
+        except TypeError:
+            name = self.targetGenes[0]['name']
+            if name[:3] == 'ENS':
+                ensembl_id = name.split('.')[0]
+                ens_seq_map, empty_seqs = retrieve_transcript_sequences([ensembl_id])
+                if ensembl_id in ens_seq_map:
+                    seq = ens_seq_map[ensembl_id]
+                    self.targetGenes[0]['targetSequence'] = {'sequence':seq, 'sequenceType':'protein'}
+                    return seq
+            elif name[:3] == 'NC_' or name[:3] == 'NM_':
+                nc_id = name.split('.')[0]
+                nc_seq_map = get_refseq_sequences([nc_id], seq_type='nucleotide')
+                if nc_id in nc_seq_map:
+                    seq = nc_seq_map[nc_id]
+                    self.targetGenes[0]['targetSequence'] = {'sequence':seq, 'sequenceType':'protein'}
+                    return seq
+            print(f'TypeError, get_protein_sequence failed for {self.urn=}: {self.targetGenes=}')
+            return None
+        except IndexError:
+            print(f'IndexError, get_protein_sequence failed for {self.urn=}: {self.targetGenes=}')
+            return None
         if self.targetGenes[0]['targetSequence']['sequenceType'] == 'protein':
             return raw_seq
         else:
             return translate_dna(raw_seq)[0]
 
-    def get_full_sequence_info(self):
-        if self.current_version == 'ProteinGym':
+
+    def get_full_sequence_info(self, prot_id_from_scores = None):
+        if self.current_version == 'ProteinGym' or self.current_version == 'Domainome':
             full_seq = self.target['reference_sequence']['sequence']
-            offset = 0
-        else:
-            id_dict = {}
-            for identifier_struct in self.targetGenes[0]['externalIdentifiers']:
-                dbname = identifier_struct['identifier']['dbName']
-                offset = identifier_struct['offset']
-                identifier = identifier_struct['identifier']['identifier']
-                if dbname == 'UniProt':
-                    id_dict['uniprot'] = offset, identifier
-                elif dbname == 'Ensembl':
-                    id_dict['ensembl'] = offset, identifier
-                elif dbname == 'RefSeq':
-                    id_dict['refseq'] = offset, identifier
-            
-            if 'uniprot' in id_dict:
-                offset, identifier = id_dict['uniprot']
-                full_seq = getUniprotSequence(identifier)
-            #elif 'refseq' in id_dict:
-            #    offset, identifier = id_dict['refseq']
-            #    full_seq = get_refseq_sequences(identifier)
-            #elif 'ensembl' in id_dict:
-            #    print(f'No Uniprot, no RefSeq, but Ensembl ID: {self.urn}')
-            #    full_seq = self.get_protein_sequence()
-            #    offset = 0
+            return full_seq, 0
+        elif prot_id_from_scores is not None:
+            if prot_id_from_scores[:3] == 'ENS':
+                ensembl_id = prot_id_from_scores.split('.')[0]
+                ens_seq_map, empty_seqs = retrieve_transcript_sequences([ensembl_id])
+                if ensembl_id in ens_seq_map:
+                    seq = ens_seq_map[ensembl_id]
+                    self.targetGenes[0]['targetSequence'] = {'sequence':seq, 'sequenceType':'protein'}
+                    return seq, 0
+            elif prot_id_from_scores[:3] == 'NC_' or prot_id_from_scores[:3] == 'NM_' or prot_id_from_scores[:3] == 'NP_':
+                nc_id = prot_id_from_scores.split('.')[0]
+                if prot_id_from_scores[:3] == 'NP_':
+                    seq_type = 'protein'
+                else:
+                    seq_type = 'nucleotide'
+                nc_seq_map = get_refseq_sequences([nc_id], seq_type=seq_type)
+                if nc_id in nc_seq_map:
+                    seq = nc_seq_map[nc_id]
+                    self.targetGenes[0]['targetSequence'] = {'sequence':seq, 'sequenceType':'protein'}
+                    return seq, 0
             else:
-                full_seq = self.get_protein_sequence()
-                offset = 0
+                print(f'Uncatched {prot_id_from_scores=}')
+            
+
+        if self.corrected_seq is not None:
+            return self.corrected_seq, 0
+
+        id_dict = {}
+        for identifier_struct in self.targetGenes[0]['externalIdentifiers']:
+            dbname = identifier_struct['identifier']['dbName']
+            offset = identifier_struct['offset']
+            if 'targetSequence' in self.targetGenes[0]:
+                if 'sequenceType' in self.targetGenes[0]['targetSequence']:
+                    if self.targetGenes[0]['targetSequence']['sequenceType'] == 'dna':
+                        offset = (offset - 1)//3
+            
+            identifier = identifier_struct['identifier']['identifier']
+            if dbname == 'UniProt':
+                id_dict['uniprot'] = offset, identifier
+            elif dbname == 'Ensembl':
+                id_dict['ensembl'] = offset, identifier
+            elif dbname == 'RefSeq':
+                id_dict['refseq'] = offset, identifier
+        
+        if 'uniprot' in id_dict:
+            offset, identifier = id_dict['uniprot']
+            full_seq = getUniprotSequence(identifier)
+        #elif 'refseq' in id_dict:
+        #    offset, identifier = id_dict['refseq']
+        #    full_seq = get_refseq_sequences(identifier)
+        #elif 'ensembl' in id_dict:
+        #    print(f'No Uniprot, no RefSeq, but Ensembl ID: {self.urn}')
+        #    full_seq = self.get_protein_sequence()
+        #    offset = 0
+        else:
+            full_seq = self.get_protein_sequence()
+            offset = 0
         return full_seq, offset
 
     def get_score_table_positions(self):
@@ -128,6 +194,7 @@ class ScoreSet(APIObject, Dataset):
 
 class ProteinGymScoreset(ScoreSet):
     def __init__(self, target_name, uniprot, seq, scoresetdata, offset = 0):
+        self.targetGenes = []
         self.target = {}
         self.target['uniprot'] = {}
         self.target['uniprot']['identifier'] = uniprot
@@ -138,6 +205,20 @@ class ProteinGymScoreset(ScoreSet):
         self.target['name'] = target_name
 
         self.current_version = 'ProteinGym'
+        self.scoresetdata = scoresetdata
+
+class DomainomeScoreset(ScoreSet):
+    def __init__(self, target_name, uniprot, seq, scoresetdata):
+        self.targetGenes = []
+        self.target = {}
+        self.target['uniprot'] = {}
+        self.target['uniprot']['identifier'] = uniprot
+        self.target['reference_sequence'] = {}
+        self.target['reference_sequence']['sequence'] = seq
+        self.target['reference_sequence']['sequence_type'] = 'protein'
+        self.target['name'] = target_name
+
+        self.current_version = 'Domainome'
         self.scoresetdata = scoresetdata
 
 def load_protein_gym_scores(dms_id, path_to_dms_file):
@@ -379,6 +460,13 @@ class ScoreSetData:
         self.normalizer = sorted_scores[self.sav_cardinality - bound] - sorted_scores[bound]
         return self.normalizer
 
+    def set_std_sav(self):
+        sorted_scores = self.get_sorted_sav_values()
+        bound = max([1,round(self.sav_cardinality/100)])
+
+        self.std_sav = np.std(list(self.sav_scores.values())[bound:-bound])
+        return self.std_sav
+
     def get_number_of_covered_positions(self):
         if self.number_of_covered_positions is not None:
             return self.number_of_covered_positions
@@ -422,7 +510,48 @@ class ScoreSetData:
         return bins
 
 
-    def scale_sav_data(self, verbosity = 0):
+    def scale_domainome(self):
+        self.scaled_sav_scores = {}
+        for hgvs_pro in self.sav_scores:
+            reported_score = self.sav_scores[hgvs_pro]
+            scaled_score = reported_score + 1.0
+            self.scaled_sav_scores[hgvs_pro] = scaled_score
+
+
+    def check_scaled_scores(self):
+        count_very_strong = 0
+        count_strong = 0
+        count_moderate = 0
+        count_wt_like = 0
+        count_increasing = 0
+
+        for sav in self.scaled_sav_scores:
+            scaled_score = self.scaled_sav_scores[sav]
+            match scaled_score:
+                case x if x < 0:
+                    count_very_strong += 1
+                case x if x < 0.25:
+                    count_strong += 1
+                case x if x < 0.8:
+                    count_moderate += 1
+                case x if x < 1.2:
+                    count_wt_like += 1
+                case _:
+                    count_increasing += 1
+
+        count_all_strong = count_very_strong + count_strong
+        moderate_and_above = count_moderate + count_wt_like + count_increasing
+        all_with_effect = count_all_strong + count_moderate
+        if count_all_strong > moderate_and_above:
+            return False, f'Too many strong effects: {count_all_strong=} versus too few moderate effects {moderate_and_above=}'
+        if count_all_strong < count_moderate*0.26:
+            return False, f'Too few strong effects: {count_all_strong=} versus too many moderate effects {count_moderate=}'
+        if count_increasing > (all_with_effect*0.5):
+            return False, f'Too many increasing effects {count_increasing=} versus too few with effects {all_with_effect=}'
+        return True, None
+
+
+    def scale_sav_data(self, verbosity = 0, distribution_filtering = False):
 
         """
         Scales all sav scores. Scaling is based on a typical neutral effect score and a typical strong effect value.
@@ -444,7 +573,7 @@ class ScoreSetData:
 
         median_synonymous = median(self.synonymous_scores.values())
         sorted_scores = self.get_sorted_sav_values()
-        perc_size = max([1,round(self.sav_cardinality/100)])
+        perc_size: int = max([1,round(self.sav_cardinality/100)])
 
         self.scaled_sav_scores = {}
 
@@ -489,9 +618,11 @@ class ScoreSetData:
             left_peak = min([highest_peak, second_peak])
             right_peak = max([highest_peak, second_peak])
 
-            if second_peak_size < (0.4 * highest_peak_size):
+            if second_peak_size < (0.4 * highest_peak_size): #The two peaks need to be of similar size
                 bi_modal = False
-            else:
+            elif (right_peak - left_peak) > (len(bins) * 0.3): #The two peaks need to be close together
+                bi_modal = False
+            else: #There need to be a steep valley between the peaks
                 for bin_between_peaks in bins[(left_peak+1):right_peak]:
                     if (2*len(bin_between_peaks)) < second_peak_size:
                         bi_modal = True
@@ -517,7 +648,7 @@ class ScoreSetData:
         if self.mean_sav > median_synonymous: #larger score, stronger effect ...
             if self.pro_baseline is not None and self.ala_baseline is not None:
                 if self.pro_baseline < self.ala_baseline:
-                    print(f'Direction does not add up: {self.urn}')
+                    print(f'Direction does not add up: {self.urn} {self.pro_baseline=} {self.ala_baseline=}')
                     bottom_perc_median = median(sorted_scores[:perc_size])
                     top_perc_median = median(sorted_scores[-perc_size:])
                 else:
@@ -529,7 +660,7 @@ class ScoreSetData:
         else: #smaller score, stronger effect ...
             if self.pro_baseline is not None and self.ala_baseline is not None:
                 if self.pro_baseline > self.ala_baseline:
-                    print(f'Direction does not add up: {self.urn}')
+                    print(f'Direction does not add up 2: {self.urn} {self.pro_baseline=} {self.ala_baseline=}')
                     bottom_perc_median = median(sorted_scores[-perc_size:])
                     top_perc_median = median(sorted_scores[:perc_size])
                 else:
@@ -539,7 +670,7 @@ class ScoreSetData:
                 bottom_perc_median = median(sorted_scores[:perc_size]) #... means, we need to the left percentile
                 top_perc_median = median(sorted_scores[-perc_size:])
 
-        if verbosity >= 1:
+        if verbosity >= 2:
             print(f'Scaling SAV scores for {self.urn}')
             print(f'Min/Max score: {self.min_sav} / {self.max_sav}')
             print(f'Mean score: {self.mean_sav}')
@@ -553,17 +684,28 @@ class ScoreSetData:
 
         if (bottom_perc_median - median_synonymous) == 0:
             print(f'Bottom median equals to median synonymous: {self.urn}')
-            return None
+            return False
 
         for hgvs_pro in self.sav_scores:
             reported_score = self.sav_scores[hgvs_pro]
             scaled_score = score_scale_function(reported_score, median_synonymous, bottom_perc_median, top_perc_median)
             self.scaled_sav_scores[hgvs_pro] = scaled_score
 
+        scaled_wt_score = score_scale_function(median_synonymous, median_synonymous, bottom_perc_median, top_perc_median)
+
+        if distribution_filtering:
+            is_alright, reason = self.check_scaled_scores()
+
+            if not is_alright:
+                print(f'Scaling failed for {self.urn} due to {reason=}')
+                self.scaled_sav_scores = []
+                return False
+
         min_value = min(self.scaled_sav_scores.values())
         max_value = max(self.scaled_sav_scores.values())
         scaled_median = median(self.scaled_sav_scores.values())
 
+        """
         if scaled_median < 0.4:
             shift = 0.4 / scaled_median
         else:
@@ -575,17 +717,19 @@ class ScoreSetData:
                 scaled_score = self.scaled_sav_scores[hgvs_pro]
                 scaled_score = second_scale(scaled_score, min_value, max_value, shift)
                 self.scaled_sav_scores[hgvs_pro] = scaled_score
+        """
 
-        if verbosity >= 1:
-            scaled_wt_score = score_scale_function(median_synonymous, median_synonymous, bottom_perc_median, top_perc_median)
-            second_scaled_wt_score = second_scale(scaled_wt_score, min_value, max_value, shift)
+        if verbosity >= 2:
+            
+            #second_scaled_wt_score = second_scale(scaled_wt_score, min_value, max_value, shift)
             scaled_strong_score = score_scale_function(bottom_perc_median, median_synonymous, bottom_perc_median, top_perc_median)
-            second_scaled_strong_score = second_scale(scaled_strong_score, min_value, max_value, shift)
+            #second_scaled_strong_score = second_scale(scaled_strong_score, min_value, max_value, shift)
             print(f'Scaled WT-like score: {scaled_wt_score}')
             print(f'Scaled strong effect score: {scaled_strong_score}')
             print(f'Scaled median effect score: {scaled_median}')
-            print(f'Second scaled WT-like score: {second_scaled_wt_score}')
-            print(f'Second scaled strong effect score: {second_scaled_strong_score}')
+            #print(f'Second scaled WT-like score: {second_scaled_wt_score}')
+            #print(f'Second scaled strong effect score: {second_scaled_strong_score}')
+        return True
 
     def plot_sav_score_distribution(self, outfile, specific_scores = None):
 
@@ -615,6 +759,9 @@ class ScoreSetData:
         plt.hist(data, bins=50)
         plt.gca().set(title=f'Score distribution for {self.urn}', ylabel='Frequency', xlabel = 'Effect score');
         plt.savefig(outfile)
+        plt.clf()
+        plt.cla()
+        plt.close()
 
 
     def write_nonsense_tsv(self, outfile):
